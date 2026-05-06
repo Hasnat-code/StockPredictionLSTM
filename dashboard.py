@@ -21,17 +21,42 @@ df = pd.DataFrame()
 symbol = ""
 
 if data_source == "Live Stocks":
-    symbol = st.sidebar.text_input("Enter Stock Ticker", "AAPL").upper()
-    start_date = st.sidebar.date_input("Start Date", value=datetime(2015, 1, 1))
-    df = yf.download(symbol, start=start_date, end=datetime.now(), auto_adjust=True)
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
+    symbol = st.sidebar.text_input("Enter Stock Ticker", "AMZN").upper()
+
+    # SPECIAL LOGIC FOR AMZN: Combine Historical CSV + Live Data
+    if symbol == "AMZN":
+        try:
+            # 1. Load historical AMZN from CSV (2013-2019)
+            hist_df = pd.read_csv('portfolio_data.csv')
+            hist_df['Date'] = pd.to_datetime(hist_df['Date'])
+            hist_df.set_index('Date', inplace=True)
+            historical_amzn = hist_df[['AMZN']].rename(columns={'AMZN': 'Close'})
+
+            # 2. Fetch live AMZN data from the end of the CSV to Today
+            live_amzn = yf.download(symbol, start='2019-12-01', end=datetime.now(), auto_adjust=True)
+            if isinstance(live_amzn.columns, pd.MultiIndex):
+                live_amzn.columns = live_amzn.columns.get_level_values(0)
+            live_amzn = live_amzn[['Close']]
+
+            # 3. Merge them
+            df = pd.concat([historical_amzn, live_amzn])
+            st.sidebar.success("Successfully Merged CSV + Live AMZN Data")
+        except FileNotFoundError:
+            st.sidebar.warning("CSV not found. Falling back to Live Data only.")
+            df = yf.download(symbol, start='2015-01-01', end=datetime.now(), auto_adjust=True)
+    else:
+        # Standard Live Fetch for any other ticker
+        df = yf.download(symbol, start='2015-01-01', end=datetime.now(), auto_adjust=True)
+
+    # Cleanup for standard yfinance structure
     if not df.empty:
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
         df = df[['Close']]
 
 else:
     try:
-        # Load your specific portfolio_data.csv
+        # Load the raw portfolio_data.csv
         df_raw = pd.read_csv('portfolio_data.csv')
         df_raw['Date'] = pd.to_datetime(df_raw['Date'])
         df_raw.set_index('Date', inplace=True)
@@ -45,10 +70,11 @@ else:
 # --- 3. DASHBOARD MAIN VIEW ---
 if not df.empty:
     # Row 1: Data Table & Stats
-    st.subheader(f"Historical Data Overview: {symbol}")
+    st.subheader(f"Data Overview: {symbol}")
     col_table, col_stats = st.columns([2, 1])
     with col_table:
-        st.dataframe(df.tail(10), use_container_width=True)
+        # Fixed the width warning
+        st.dataframe(df.tail(10), width=1000)
     with col_stats:
         st.write("**Quick Stats**")
         st.write(df.describe())
@@ -81,16 +107,15 @@ if not df.empty:
             current_price = df['Close'].iloc[-1]
             avg_price = df['Close'].mean()
             if current_price < avg_price:
-                st.info(
-                    "💡 **Analysis:** Stock is currently trading below its historical average. This might be a dip worth investigating.")
+                st.info("💡 **Analysis:** Trading below historical average. Potential buying opportunity.")
             else:
-                st.info("💡 **Analysis:** Stock is trading at a premium compared to its historical average.")
+                st.info("💡 **Analysis:** Trading at a premium. Market sentiment is high.")
 
     # --- PREDICTION SECTION ---
     with col2:
         if st.button("🤖 Predict with LSTM"):
             st.markdown("### AI Prediction Results")
-            with st.spinner("Training LSTM Model... Please wait (this takes ~60s)"):
+            with st.spinner("Training LSTM on Combined Data..."):
 
                 # 1. Preprocess
                 dataset = df.values
@@ -124,18 +149,17 @@ if not df.empty:
                 pred_price = model.predict(x_input)
                 pred_price = scaler.inverse_transform(pred_price)
 
-                current_val = df['Close'].iloc[-1]
+                current_val = float(df['Close'].iloc[-1])
                 diff = pred_price[0][0] - current_val
 
                 # 4. Display Results
                 st.metric("Predicted Price (Next Day)", f"${pred_price[0][0]:.2f}", delta=f"{diff:.2f}")
 
                 if diff > 0:
-                    st.success(
-                        "✅ **Recommendation:** The model predicts an upward trend. High potential for investment.")
+                    st.success("✅ **Recommendation:** Upward trend predicted. High potential for investment.")
                 else:
-                    st.warning(
-                        "❌ **Recommendation:** The model predicts a downward move. Caution advised before investing.")
+                    st.warning("❌ **Recommendation:** Downward trend predicted. Suggest waiting for a dip.")
 
 else:
     st.info("Select a data source from the sidebar to begin analysis.")
+    ##& "H:\AI project\StockPredictionLSTM\.venv\Scripts\python.exe" -m streamlit run "H:\AI project\StockPredictionLSTM\dashboard.py"
