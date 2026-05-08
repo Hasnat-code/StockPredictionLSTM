@@ -6,6 +6,7 @@ from sklearn.preprocessing import MinMaxScaler
 from keras.models import Sequential
 from keras.layers import Dense, LSTM, Dropout
 from datetime import datetime
+from collections import deque
 import os
 
 # ---------------- PAGE SETUP ----------------
@@ -35,6 +36,10 @@ if 'logged_in' not in st.session_state:
 
 if 'username' not in st.session_state:
     st.session_state.username = ""
+
+# STACK
+if 'recent_stack' not in st.session_state:
+    st.session_state.recent_stack = []
 
 # ---------------- FILES ----------------
 users_file = "users.txt"
@@ -79,6 +84,32 @@ def user_exists(username, password):
 
     return False
 
+
+# SET
+def get_all_users():
+
+    users = set()
+
+    if os.path.exists(users_file):
+
+        with open(users_file, "r") as f:
+
+            lines = f.readlines()
+
+            for line in lines[1:]:
+
+                if "|" in line:
+
+                    username = (
+                        line.strip()
+                        .split("|")[0]
+                    )
+
+                    users.add(username)
+
+    return users
+
+
 # ---------------- UTILITIES ----------------
 def clean_val(x):
 
@@ -109,7 +140,8 @@ def update_actual_prices(username):
     if not os.path.exists(file_path):
         return
 
-    updated_lines = []
+    # QUEUE
+    updated_lines = deque()
 
     with open(file_path, "r") as f:
 
@@ -199,13 +231,13 @@ def calculate_rsi(data, window=14):
     delta = data.diff()
 
     gain = (
-        delta.where(delta > 0, 0)
+        delta.where(delta > 0, 0) ##only postive value
         .rolling(window=window)
         .mean()
     )
 
     loss = (
-        (-delta.where(delta < 0, 0))
+        (-delta.where(delta < 0, 0)) ##only negativevalue
         .rolling(window=window)
         .mean()
     )
@@ -291,14 +323,24 @@ if not st.session_state.logged_in:
 
             else:
 
-                save_user(
-                    reg_user,
-                    reg_pass
-                )
+                all_users = get_all_users()
 
-                st.success(
-                    "Account created successfully"
-                )
+                if reg_user in all_users:
+
+                    st.error(
+                        "Username already exists"
+                    )
+
+                else:
+
+                    save_user(
+                        reg_user,
+                        reg_pass
+                    )
+
+                    st.success(
+                        "Account created successfully"
+                    )
 
     st.stop()
 
@@ -392,6 +434,12 @@ selected_info = master_df[
 ].iloc[0]
 
 symbol = str(selected_info['Symbol']).strip()
+
+# TUPLE
+coin_tuple = (
+    selected_name,
+    symbol
+)
 
 # ---------------- FETCH LIVE DATA ----------------
 @st.cache_data
@@ -637,6 +685,9 @@ if not hist_df.empty:
                     pred_raw
                 )[0][0]
 
+                # STACK PUSH
+                st.session_state.recent_stack.append(pred)
+
                 diff = pred - current_p
 
                 st.metric(
@@ -653,6 +704,16 @@ if not hist_df.empty:
 
                 st.success(
                     "Prediction saved successfully."
+                )
+
+                # STACK TOP
+                latest_stack_pred = (
+                    st.session_state.recent_stack[-1]
+                )
+
+                st.info(
+                    f"Latest Stack Prediction: "
+                    f"${latest_stack_pred:,.2f}"
                 )
 
     # -------- VALIDATION --------
