@@ -2,4 +2,7 @@ Prediction History of jutt
 ------------------------------------------------------------
 2026-05-07 21:02 | ETH | Prediction: 2,357.30 | Actual: 2,292.98
 2026-05-07 21:37 | BTC | Prediction: 80,354.67 | Actual: 80,119.99
-2026-05-08 11:22 | BTC | Prediction: 78,465.05 | Actual: Pending
+2026-05-08 11:22 | BTC | Prediction: 78,465.05 | Actual: 80,556.61
+2026-05-12 16:19 | BTC | Prediction: 80,513.51 | Actual: 80,754.97
+2026-05-12 16:35 | BTC | Prediction: 81,406.70 | Actual: 80,754.97
+2026-05-12 17:04 | BTC | Prediction: 81,488.76 | Actual: 80,379.18
