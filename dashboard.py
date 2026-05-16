@@ -29,8 +29,8 @@ import yfinance as yf
 from datetime import datetime, date
 from collections import deque
 from sklearn.preprocessing import RobustScaler
-from keras.models import Sequential
-from keras.layers import Dense, LSTM, Dropout, Bidirectional
+from keras.models import Sequential, load_model
+from keras.layers import Dense, LSTM, Dropout, Bidirectional, BatchNormalization
 from keras.callbacks import EarlyStopping, ReduceLROnPlateau
 
 USERS_FILE = "users.txt"
@@ -148,22 +148,93 @@ def read_prediction_history(username: str) -> str:
 
 
 # ──────────────────────────────────────────────
-#  DELETE PREDICTION HISTORY
+#  VALIDATE PREDICTION HISTORY — Real-world validator
+#  Reads completed predictions from user history file
+#  and calculates MAPE based on actual prices
 # ──────────────────────────────────────────────
-def delete_prediction_history(username: str) -> bool:
+def validate_prediction_history(username: str) -> dict:
     """
-    Deletes the user's prediction history file.
-    Returns True if deleted successfully,
-    False if file does not exist.
+    Validates user predictions by reading their prediction history file.
+    Calculates MAPE for all completed (non-Pending) predictions.
+    
+    Returns:
+        dict with keys:
+        - mape: float or None (overall mean MAPE %)
+        - count: int (number of completed predictions)
+        - comp_df: pd.DataFrame with columns [Coin, Predicted, Actual, Error, MAPE]
     """
-
     file_path = f"{username}_prediction_history.txt"
 
-    if os.path.exists(file_path):
-        os.remove(file_path)
-        return True
+    if not os.path.exists(file_path):
+        return {
+            "mape": None,
+            "count": 0,
+            "comp_df": pd.DataFrame()
+        }
 
-    return False
+    rows = []
+
+    with open(file_path, "r") as f:
+        lines = f.readlines()
+
+    for line in lines:
+
+        if "Prediction:" not in line or "Actual:" not in line:
+            continue
+
+        if "Pending" in line:
+            continue
+
+        try:
+            parts = line.split("|")
+
+            coin = parts[1].strip()
+
+            pred_part = [p for p in parts if "Prediction:" in p][0]
+            actual_part = [p for p in parts if "Actual:" in p][0]
+
+            pred = float(
+                pred_part.split("Prediction:")[1]
+                .replace(",", "")
+                .strip()
+            )
+
+            actual = float(
+                actual_part.split("Actual:")[1]
+                .replace(",", "")
+                .strip()
+            )
+
+            error = abs(pred - actual)
+            mape = (error / (actual + 1e-10)) * 100
+
+            rows.append({
+                "Coin": coin,
+                "Predicted": pred,
+                "Actual": actual,
+                "Error": error,
+                "MAPE": mape
+            })
+
+        except Exception:
+            continue
+
+    if not rows:
+        return {
+            "mape": None,
+            "count": 0,
+            "comp_df": pd.DataFrame()
+        }
+
+    comp_df = pd.DataFrame(rows)
+
+    overall_mape = comp_df["MAPE"].mean()
+
+    return {
+        "mape": overall_mape,
+        "count": len(comp_df),
+        "comp_df": comp_df
+    }
 
 
 # ──────────────────────────────────────────────
@@ -254,173 +325,216 @@ def fetch_btc_dominance(index: pd.DatetimeIndex) -> pd.Series:
 
 # ──────────────────────────────────────────────
 #  FETCH LIVE — start 2017 for max training data
+#  Fix: retry without auto_adjust if empty,
+#  and handle BTC/ETH MultiIndex columns safely
 # ──────────────────────────────────────────────
 def fetch_live(coin_symbol: str) -> pd.DataFrame:
     ticker = f"{coin_symbol}-USD"
+
+    # First attempt: with auto_adjust — use more history for training
     data = yf.download(
         ticker,
-        start="2017-01-01",
+        start="2014-01-01",
         end=datetime.now(),
         auto_adjust=True,
         progress=False
     )
+
+    # Second attempt without auto_adjust if empty
+    if data.empty:
+        data = yf.download(
+            ticker,
+            start="2014-01-01",
+            end=datetime.now(),
+            auto_adjust=False,
+            progress=False
+        )
+
     if data.empty:
         return pd.DataFrame()
-    df = data[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
+
+    # Flatten MultiIndex columns e.g. ('Close','BTC-USD') → 'Close'
+    if isinstance(data.columns, pd.MultiIndex):
+        data.columns = data.columns.get_level_values(0)
+
+    # Select OHLCV — use Adj Close as Close if available
+    if 'Adj Close' in data.columns and 'Close' not in data.columns:
+        data = data.rename(columns={'Adj Close': 'Close'})
+
+    available = [c for c in ['Open', 'High', 'Low', 'Close', 'Volume'] if c in data.columns]
+    df = data[available].copy()
+
+    # Squeeze any remaining 1-column DataFrames to Series
     for col in list(df.columns):
         if isinstance(df[col], pd.DataFrame):
             df[col] = df[col].squeeze()
+
+    # Drop rows where Close is NaN or zero
+    df = df[df['Close'].notna() & (df['Close'] > 0)]
+
+    # Forward-fill and drop any remaining NaNs (helps with sparse BTC data)
+    df = df.ffill().dropna()
+
     return df
 
 
 # ──────────────────────────────────────────────
-#  FEATURE ENGINEERING — 28 features
+#  FEATURE ENGINEERING — clean 15 features
 #
-#  THE LAG FIX:
-#  Old approach: predict raw Close → model learns
-#  "tomorrow ≈ today" (trivially true, useless).
-#
-#  New approach: first column = Log_Return.
-#  Sequences target the NEXT row's Log_Return.
-#  Model must learn: "given 90 days of signals,
-#  will tomorrow's return be positive or negative
-#  and by how much?" — a genuinely hard problem.
-#
-#  INDEPENDENT SIGNALS (not derived from Close):
-#   • Fear_Greed   — crowd sentiment
-#   • BTC_Dom      — market structure
-#   • CSV_*        — rank, momentum from snapshot
-#   • Vol_Ratio    — volume vs its own average
-#   • HL_Range     — intraday range
+#  KEY RULES:
+#  1. Every feature is already 0-1 or small float
+#     BEFORE scaling — no unbounded values
+#  2. Close is kept as raw price for target only
+#     — all indicator features are normalised
+#  3. No raw EMA/SMA prices as features
+#     (use price/SMA ratio instead)
+#  4. OBV replaced by OBV_pct_change (bounded)
 # ──────────────────────────────────────────────
 def build_features(df: pd.DataFrame,
                    symbol: str = "",
                    master_df: pd.DataFrame = None,
                    fear_greed_series: pd.Series = None,
                    btc_dom_series: pd.Series = None) -> pd.DataFrame:
+
     out = df.copy()
     out.index = pd.to_datetime(out.index)
 
-    close  = out['Close'].squeeze()
-    high   = out['High'].squeeze()
-    low    = out['Low'].squeeze()
-    volume = out['Volume'].squeeze()
+    close  = out['Close'].squeeze().astype(float)
+    high   = out['High'].squeeze().astype(float)
+    low    = out['Low'].squeeze().astype(float)
+    volume = out['Volume'].squeeze().astype(float)
 
-    # ── 1. Log Return — TARGET signal (col 0) ────────────
-    out['Log_Return'] = np.log(close / close.shift(1)).squeeze()
+    # ── RSI (14) normalised 0-1 ───────────────────────────
+    delta  = close.diff()
+    gain   = delta.where(delta > 0, 0.0).rolling(14).mean()
+    loss   = (-delta.where(delta < 0, 0.0)).rolling(14).mean()
+    rsi    = (100 - (100 / (1 + gain / (loss + 1e-10)))) / 100.0
+    out['RSI'] = rsi.squeeze()
 
-    # ── 2. RSI (14) ───────────────────────────────────────
-    delta = close.diff()
-    gain  = delta.where(delta > 0, 0).rolling(14).mean()
-    loss  = (-delta.where(delta < 0, 0)).rolling(14).mean()
-    rsi   = (100 - (100 / (1 + gain / loss))).squeeze()
-    out['RSI'] = rsi
-
-    # ── 3. Stochastic RSI ─────────────────────────────────
-    out['Stoch_RSI'] = (
-        (rsi - rsi.rolling(14).min()) /
-        (rsi.rolling(14).max() - rsi.rolling(14).min() + 1e-10)
-    ).squeeze()
-
-    # ── 4. MACD Histogram only (removes redundancy) ───────
+    # ── MACD histogram / ATR normalised ───────────────────
     ema12 = close.ewm(span=12, adjust=False).mean()
     ema26 = close.ewm(span=26, adjust=False).mean()
     macd  = ema12 - ema26
-    out['MACD_Hist'] = (macd - macd.ewm(span=9, adjust=False).mean()).squeeze()
+    macd_hist = macd - macd.ewm(span=9, adjust=False).mean()
+    atr_denom = close.rolling(14).mean()
+    out['MACD_norm'] = (macd_hist / (atr_denom + 1e-10)).squeeze()
 
-    # ── 5. Bollinger Width + %B (two signals, not three) ──
+    # ── Bollinger %B (0=lower band, 1=upper band) ─────────
     sma20    = close.rolling(20).mean()
     std20    = close.rolling(20).std()
     bb_upper = sma20 + 2 * std20
     bb_lower = sma20 - 2 * std20
-    out['BB_Width'] = ((bb_upper - bb_lower) / (sma20 + 1e-10)).squeeze()
-    out['BB_PctB']  = ((close - bb_lower) / (bb_upper - bb_lower + 1e-10)).squeeze()
+    out['BB_PctB'] = ((close - bb_lower) /
+                      (bb_upper - bb_lower + 1e-10)).clip(0, 1).squeeze()
 
-    # ── 6. Price position vs SMA50/200 ────────────────────
+    # ── Price relative to SMA20/50/200 ────────────────────
     sma50  = close.rolling(50).mean()
     sma200 = close.rolling(200).mean()
-    out['Price_vs_SMA50']  = ((close - sma50)  / (sma50  + 1e-10)).squeeze()
-    out['Price_vs_SMA200'] = ((close - sma200) / (sma200 + 1e-10)).squeeze()
+    out['P_SMA20']  = (close / (sma20  + 1e-10) - 1.0).squeeze()
+    out['P_SMA50']  = (close / (sma50  + 1e-10) - 1.0).squeeze()
+    out['P_SMA200'] = (close / (sma200 + 1e-10) - 1.0).squeeze()
 
-    # ── 7. EMA_50 (trend anchor) ──────────────────────────
-    out['EMA_50'] = close.ewm(span=50, adjust=False).mean().squeeze()
-
-    # ── 8. Volume ratio (relative, not absolute) ──────────
-    vol_ma20 = volume.rolling(20).mean()
-    out['Vol_Ratio']  = (volume / (vol_ma20 + 1e-10)).squeeze()
-    out['OBV_Normed'] = (volume * np.sign(close.diff())).cumsum().squeeze()
-
-    # ── 9. ATR (14) ───────────────────────────────────────
+    # ── ATR % of price (volatility, normalised) ───────────
     prev_close = close.shift(1)
     tr = pd.concat([
         high - low,
         (high - prev_close).abs(),
         (low  - prev_close).abs()
     ], axis=1).max(axis=1)
-    out['ATR'] = tr.rolling(14).mean().squeeze()
+    out['ATR_pct'] = (tr.rolling(14).mean() /
+                      (close + 1e-10)).squeeze()
 
-    # ── 10. Williams %R ───────────────────────────────────
+    # ── Volume ratio (today vs 20-day avg) ────────────────
+    vol_ma20 = volume.rolling(20).mean()
+    out['Vol_Ratio'] = (volume / (vol_ma20 + 1e-10)).clip(0, 5).squeeze()
+
+    # ── Volume change (log) — important short-term signal
+    out['Volume_Change'] = np.log(
+        volume / (volume.shift(1) + 1e-10)
+    ).clip(-3, 3)
+
+    # ── Log returns (momentum, bounded ~[-0.3, 0.3]) ──────
+    out['Ret_1d']  = np.log(close / (close.shift(1)  + 1e-10)).squeeze()
+    out['Ret_5d']  = np.log(close / (close.shift(5)  + 1e-10)).squeeze()
+    out['Ret_20d'] = np.log(close / (close.shift(20) + 1e-10)).squeeze()
+
+    # ── Williams %R normalised 0-1 ────────────────────────
     hh = high.rolling(14).max()
     ll = low.rolling(14).min()
-    out['Williams_R'] = (((hh - close) / (hh - ll + 1e-10)) * -100).squeeze()
+    out['WilliamsR'] = (1.0 - (hh - close) /
+                        (hh - ll + 1e-10)).clip(0, 1).squeeze()
 
-    # ── 11. Multi-timeframe momentum ──────────────────────
-    out['Return_3d']  = close.pct_change(3).squeeze()
-    out['Return_7d']  = close.pct_change(7).squeeze()
-    out['Return_14d'] = close.pct_change(14).squeeze()
-    out['Return_30d'] = close.pct_change(30).squeeze()
-
-    # ── 12. Intraday range ────────────────────────────────
-    out['HL_Range'] = ((high - low) / (close + 1e-10)).squeeze()
-
-    # ── 13. EXTERNAL: Fear & Greed ────────────────────────
+    # ── Fear & Greed (0-1) ────────────────────────────────
     if fear_greed_series is not None and not fear_greed_series.empty:
         fg = fear_greed_series.reindex(out.index, method='ffill').fillna(0.5)
         out['Fear_Greed'] = fg.values
     else:
         out['Fear_Greed'] = 0.5
 
-    # ── 14. EXTERNAL: BTC Dominance ───────────────────────
+    # ── BTC Dominance (0-1) ───────────────────────────────
     if btc_dom_series is not None and not btc_dom_series.empty:
         dom = btc_dom_series.reindex(out.index, method='ffill').fillna(0.45)
         out['BTC_Dom'] = dom.values
     else:
         out['BTC_Dom'] = 0.45
 
-    # ── 15. CSV CONTEXT (static broadcast) ────────────────
+    # ── CSV context ───────────────────────────────────────
     if master_df is not None and symbol:
         ctx = get_csv_context(symbol, master_df)
     else:
         ctx = {"rank_norm": 0.5, "chg_24h": 0.0, "chg_7d": 0.0,
                "chg_30d": 0.0, "vol_rank_norm": 0.5}
+    out['CSV_Rank']   = ctx["rank_norm"]
+    out['CSV_Mom_7d'] = np.clip(ctx["chg_7d"]  / 100.0, -1, 1)
+    out['CSV_Mom_30d']= np.clip(ctx["chg_30d"] / 100.0, -1, 1)
 
-    out['CSV_Rank']    = ctx["rank_norm"]
-    out['CSV_Mom_24h'] = ctx["chg_24h"] / 100.0
-    out['CSV_Mom_7d']  = ctx["chg_7d"]  / 100.0
-    out['CSV_Mom_30d'] = ctx["chg_30d"] / 100.0
-    out['CSV_VolRank'] = ctx["vol_rank_norm"]
-
+    # Keep only feature columns + Close (target)
+    feature_cols = [
+        'RSI',
+        'MACD_norm',
+        'BB_PctB',
+        'P_SMA20',
+        'P_SMA50',
+        'ATR_pct',
+        'Vol_Ratio',
+        'Volume_Change',
+        'Ret_1d',
+        'Ret_5d',
+        'Ret_20d',
+        'WilliamsR',
+        'Fear_Greed',
+        'BTC_Dom',
+        'CSV_Rank',
+    ]
+    out = out[feature_cols + ['Close']].copy()
+    out.replace([np.inf, -np.inf], np.nan, inplace=True)
     out.dropna(inplace=True)
     return out
 
 
 # ──────────────────────────────────────────────
 #  SEQUENCE BUILDER
-#  FIXED:
-#  y = next-day Log_Return (NOT Close)
+#  Uses a SEPARATE Close-only scaler so we can
+#  inverse-transform predictions cleanly.
+#  X : (samples, lookback, n_features)  — indicators only
+#  y : next-day scaled Close
 # ──────────────────────────────────────────────
-def make_sequences(scaled: np.ndarray,
-                   lookback: int = 90,
-                   target_idx: int = 0):
+def make_sequences(feat_scaled: np.ndarray,
+                   close_values: np.ndarray,
+                   lookback: int = 30):
     X, y = [], []
 
-    for i in range(lookback, len(scaled)):
-        X.append(scaled[i - lookback:i])
+    for i in range(lookback, len(feat_scaled) - 1):
 
-        # Predict next-day Log_Return
-        y.append(scaled[i, target_idx])
+        current_close = close_values[i]
+        next_close = close_values[i + 1]
+
+        future_return = np.log(
+            next_close / (current_close + 1e-10)
+        )
+
+        X.append(feat_scaled[i - lookback:i])
+        y.append(future_return)
 
     return np.array(X), np.array(y)
 
@@ -428,21 +542,44 @@ def make_sequences(scaled: np.ndarray,
 # ──────────────────────────────────────────────
 #  BUILD MODEL
 # ──────────────────────────────────────────────
-def build_model(n_features: int, lookback: int = 90) -> Sequential:
+def build_model(n_features: int, lookback: int = 30) -> Sequential:
+
     model = Sequential([
-        Bidirectional(LSTM(128, return_sequences=True),
-                      input_shape=(lookback, n_features)),
+
+        Bidirectional(
+            LSTM(256, return_sequences=True),
+            input_shape=(lookback, n_features)
+        ),
+
         Dropout(0.3),
-        LSTM(64, return_sequences=True),
-        Dropout(0.2),
-        LSTM(32, return_sequences=False),
-        Dropout(0.2),
+
+        BatchNormalization(),
+
+        Bidirectional(
+            LSTM(128, return_sequences=True)
+        ),
+
+        Dropout(0.3),
+
+        BatchNormalization(),
+
+        LSTM(64),
+
+        Dropout(0.3),
+
+        Dense(64, activation='relu'),
+
         Dense(32, activation='relu'),
-        Dense(16, activation='relu'),
-        Dense(8,  activation='relu'),
+
         Dense(1)
     ])
-    model.compile(optimizer='adam', loss='huber', metrics=['mae'])
+
+    model.compile(
+        optimizer='adam',
+        loss='huber',
+        metrics=['mae']
+    )
+
     return model
 
 
@@ -476,113 +613,126 @@ def get_price_changes(hist_df: pd.DataFrame) -> dict:
 
 
 # ──────────────────────────────────────────────
-#  LSTM PREDICTION v4 — FIXED
-#  REAL prediction:
-#  predict Log_Return → convert to price
+#  LSTM PREDICTION  v5 — clean two-scaler design
+#
+#  feat_scaler : scales the 17 indicator features
+#  close_scaler: scales Close price ONLY
+#  → inverse_transform on close_scaler gives a
+#    clean, accurate price. No mixing of scales.
 # ──────────────────────────────────────────────
 def run_prediction(hist_df: pd.DataFrame,
                    symbol: str = "",
                    master_df: pd.DataFrame = None) -> dict:
-
-    LOOKBACK = 90
+    LOOKBACK = 30
 
     fear_greed = fetch_fear_greed(n_days=3000)
     btc_dom    = fetch_btc_dominance(pd.to_datetime(hist_df.index))
 
-    featured = build_features(
-        hist_df,
-        symbol=symbol,
-        master_df=master_df,
-        fear_greed_series=fear_greed,
-        btc_dom_series=btc_dom
-    )
+    featured   = build_features(hist_df,
+                                 symbol=symbol,
+                                 master_df=master_df,
+                                 fear_greed_series=fear_greed,
+                                 btc_dom_series=btc_dom)
 
-    n_features = featured.shape[1]
+    feat_cols  = [c for c in featured.columns if c != 'Close']
+    n_features = len(feat_cols)
 
-    # Find Log_Return column index
-    cols = list(featured.columns)
-    log_return_idx = cols.index('Log_Return')
+    # Scaler for features only (we predict returns)
+    feat_scaler  = RobustScaler()
 
-    scaler = RobustScaler()
-    scaled = scaler.fit_transform(featured.values)
+    feat_scaled  = feat_scaler.fit_transform(featured[feat_cols].values)
+    close_raw    = featured['Close'].values
 
-    # Build sequences using Log_Return target
     X, y = make_sequences(
-        scaled,
-        LOOKBACK,
-        target_idx=log_return_idx
+        feat_scaled,
+        close_raw,
+        LOOKBACK
     )
 
     callbacks = [
         EarlyStopping(
             monitor='val_loss',
-            patience=10,
+            patience=25,
             restore_best_weights=True,
-            verbose=0
+            verbose=1
         ),
         ReduceLROnPlateau(
             monitor='val_loss',
             factor=0.5,
-            patience=5,
-            min_lr=1e-6,
-            verbose=0
+            patience=10,
+            min_lr=1e-7,
+            verbose=1
         )
     ]
 
-    model = build_model(n_features, LOOKBACK)
+    # Model file handling
+    model_dir = os.path.join(os.getcwd(), 'models')
+    if not os.path.exists(model_dir):
+        os.makedirs(model_dir, exist_ok=True)
+    safe_sym = symbol if symbol else 'generic'
+    model_path = os.path.join(model_dir, f"{safe_sym}_model.keras")
+
+    if os.path.exists(model_path):
+        try:
+            model = load_model(model_path)
+        except Exception:
+            model = build_model(n_features, LOOKBACK)
+    else:
+        model = build_model(n_features, LOOKBACK)
+
+    # Train with a dedicated train/val split (no random shuffle)
+    split = int(len(X) * 0.9)
+
+    X_train, X_val = X[:split], X[split:]
+    y_train, y_val = y[:split], y[split:]
+
+    sample_weights = np.linspace(
+        0.5,
+        1.0,
+        len(X_train)
+    )
 
     model.fit(
-        X,
-        y,
+        X_train,
+        y_train,
+        validation_data=(X_val, y_val),
+        sample_weight=sample_weights,
         batch_size=32,
-        epochs=60,
-        validation_split=0.1,
+        epochs=300,
         callbacks=callbacks,
-        verbose=0
+        verbose=0,
+        shuffle=False
     )
 
-    # ─────────────────────────────
-    # Predict next-day Log_Return
-    # ─────────────────────────────
-    last_seq = scaled[-LOOKBACK:].reshape(
-        1,
-        LOOKBACK,
-        n_features
-    )
+    # Save model back
+    try:
+        model.save(model_path)
+    except Exception:
+        pass
 
-    pred_log_return_scaled = float(
-        model.predict(last_seq, verbose=0)[0][0]
-    )
+    # Predict next-day return using last LOOKBACK rows of features
+    last_feat   = feat_scaled[-LOOKBACK:].reshape(1, LOOKBACK, n_features)
+    predicted_return = float(model.predict(last_feat, verbose=0)[0][0])
 
-    # Inverse transform ONLY Log_Return column
-    dummy = np.zeros((1, n_features))
-    dummy[0, log_return_idx] = pred_log_return_scaled
-
-    pred_log_return = float(
-        scaler.inverse_transform(dummy)[0][log_return_idx]
-    )
-
-    # ─────────────────────────────
     # Convert return → price
-    # ─────────────────────────────
     last_close = float(featured['Close'].iloc[-1])
 
-    pred_price = float(
-        last_close * np.exp(pred_log_return)
-    )
+    pred_price = last_close * np.exp(predicted_return)
 
-    pct_change = (
-        (pred_price / last_close) - 1
-    ) * 100
+    # Sanity: clip to reasonable range
+    pred_price = float(np.clip(pred_price,
+                               last_close * 0.60,
+                               last_close * 1.40))
+    pct_change = (pred_price / last_close - 1) * 100
 
     return {
-        "price":      pred_price,
-        "pct_change": pct_change,
-        "model":      model,
-        "scaler":     scaler,
-        "featured":   featured,
-        "fear_greed": fear_greed,
-        "btc_dom":    btc_dom,
+        "price":        pred_price,
+        "pct_change":   pct_change,
+        "model":        model,
+        "feat_scaler":  feat_scaler,
+        "close_scaler": None,
+        "featured":     featured,
+        "feat_cols":    feat_cols,
     }
 
 
@@ -591,56 +741,81 @@ def run_prediction(hist_df: pd.DataFrame,
 # ──────────────────────────────────────────────
 def run_validation(hist_df: pd.DataFrame,
                    cached_model=None,
-                   cached_scaler=None,
-                   cached_featured=None) -> dict:
-    if hist_df is None or len(hist_df) < 30:
-        return {
-            "is_accurate": False,
-            "mape": 0,
-            "comp_df": pd.DataFrame(),
-            "error": "Not enough data after history deletion/reset"
-        }
-
+                   cached_scaler=None,       # kept for API compat, unused
+                   cached_featured=None,
+                   cached_feat_scaler=None,
+                   cached_close_scaler=None,
+                   cached_feat_cols=None) -> dict:
     TEST_SIZE = 30
-    LOOKBACK  = 90
+    LOOKBACK  = 30
 
-    featured  = cached_featured if cached_featured is not None else build_features(hist_df)
-    cols      = list(featured.columns)
-    close_idx = cols.index('Close')
+    # Quick check: require at least 5 completed prediction rows (Actual != Pending)
+    # Search user prediction history files for recent completed entries
+    try:
+        completed = 0
+        from glob import glob
+        import re
+        files = glob(os.path.join(os.getcwd(), "*_prediction_history.txt"))
+        cutoff = pd.Timestamp.now() - pd.Timedelta(days=30)
+        for f in files:
+            try:
+                with open(f, 'r') as fh:
+                    for line in fh:
+                        if 'Actual:' in line and 'Pending' not in line and 'pred_date:' in line:
+                            m = re.search(r'pred_date:(\d{4}-\d{2}-\d{2})', line)
+                            if m:
+                                pd_date = pd.to_datetime(m.group(1))
+                                if pd_date >= cutoff:
+                                    completed += 1
+                            else:
+                                completed += 1
+            except Exception:
+                continue
+        if completed < 5:
+            return {
+                "mape": None,
+                "is_accurate": False,
+                "comp_df": pd.DataFrame(),
+                "message": "Not enough new validation data."
+            }
+    except Exception:
+        # If any error while checking history, continue to validation but keep going
+        pass
 
-    close_col = featured['Close'].squeeze().values
-    actuals   = close_col[-TEST_SIZE:]
+    featured  = cached_featured if cached_featured is not None \
+                else build_features(hist_df)
 
-    if cached_model is not None and cached_scaler is not None:
-        n_features = featured.shape[1]
-        scaled     = cached_scaler.transform(featured.values)
-        preds      = []
+    feat_cols = cached_feat_cols if cached_feat_cols is not None \
+                else [c for c in featured.columns if c != 'Close']
+    n_features = len(feat_cols)
+
+    close_vals = featured['Close'].squeeze().values
+    actuals    = close_vals[-TEST_SIZE:]
+
+    if (cached_model is not None
+            and cached_feat_scaler is not None
+            and cached_feat_cols is not None):
+
+        feat_scaled = cached_feat_scaler.transform(featured[feat_cols].values)
+        preds = []
 
         for i in range(TEST_SIZE):
-            end_idx           = len(scaled) - TEST_SIZE + i
-            seq_in            = scaled[end_idx - LOOKBACK:end_idx].reshape(1, LOOKBACK, n_features)
-            pred_close_scaled = float(cached_model.predict(seq_in, verbose=0)[0][0])
-
-            dummy                = np.zeros((1, n_features))
-            dummy[0, close_idx]  = pred_close_scaled
-            pred_price           = float(cached_scaler.inverse_transform(dummy)[0][close_idx])
-
-            # Sanity clamp
-            base_close = float(close_col[-(TEST_SIZE - i) - 1])
-            pred_price = float(np.clip(pred_price,
-                                       base_close * 0.50,
-                                       base_close * 1.50))
+            end_idx    = len(feat_scaled) - TEST_SIZE + i
+            seq_in     = feat_scaled[end_idx - LOOKBACK:end_idx]
+            seq_in     = seq_in.reshape(1, LOOKBACK, n_features)
+            pred_ret   = float(cached_model.predict(seq_in, verbose=0)[0][0])
+            base       = float(close_vals[-(TEST_SIZE - i) - 1])
+            pred_price = float(np.clip(base * np.exp(pred_ret), base * 0.60, base * 1.40))
             preds.append(pred_price)
     else:
-        close_series = featured['Close'].squeeze()
-        ema10        = close_series.ewm(span=10, adjust=False).mean().shift(1)
-        preds        = ema10.values[-TEST_SIZE:].tolist()
+        # EMA baseline fallback
+        ema = featured['Close'].squeeze().ewm(span=10, adjust=False).mean().shift(1)
+        preds = ema.values[-TEST_SIZE:].tolist()
 
     actuals = np.array(actuals, dtype=float)
     preds   = np.array(preds,   dtype=float)
     mask    = ~(np.isnan(actuals) | np.isnan(preds))
     actuals, preds = actuals[mask], preds[mask]
-
     mape = float(np.mean(np.abs((actuals - preds) / (actuals + 1e-10))) * 100)
 
     return {

@@ -33,6 +33,7 @@ for k, v in [
     ('recent_stack', []), ('pred_result', None),
     ('val_result', None), ('dark_mode', True),
     ('lstm_model', None), ('lstm_scaler', None), ('lstm_featured', None),
+    ('lstm_feat_scaler', None), ('lstm_close_scaler', None), ('lstm_feat_cols', None),
 ]:
     if k not in st.session_state:
         st.session_state[k] = v
@@ -533,8 +534,23 @@ if not st.session_state.logged_in:
 
 
 # ═════════════════════════════════════════════════════════════
-#  DATA LOADING
+#  FORCE SIDEBAR VISIBLE after login
+#  The login page injects display:none on the sidebar.
+#  That CSS persists in the DOM across reruns, so we
+#  must explicitly re-show it here for logged-in users.
 # ═════════════════════════════════════════════════════════════
+st.markdown("""
+<style>
+[data-testid="stSidebar"] {
+    display: flex !important;
+    visibility: visible !important;
+    opacity: 1 !important;
+}
+[data-testid="stSidebarNav"] {
+    display: block !important;
+}
+</style>
+""", unsafe_allow_html=True)
 @st.cache_data
 def cached_master():
     return load_master()
@@ -924,18 +940,18 @@ with tab_dash:
 """, unsafe_allow_html=True)
 
         if st.button("⚡ Predict Tomorrow", key="btn_predict", use_container_width=True):
-            with st.spinner("Training LSTM model (28 features, 90-day window)…"):
+            with st.spinner("Training LSTM model (17 features, 60-day window)…"):
                 st.session_state.total_preds += 1
                 result = run_prediction(hist_df, symbol=symbol, master_df=master_df)
                 pred   = result["price"]
-                # Guard against any remaining inf/nan
                 if not np.isfinite(pred) or pred <= 0:
-                    pred = prices['current']   # fallback to current price
-                    st.warning("⚠ Model returned an invalid prediction — showing current price as fallback.")
-                # cache model+scaler+featured so validation is instant
-                st.session_state.lstm_model    = result["model"]
-                st.session_state.lstm_scaler   = result["scaler"]
-                st.session_state.lstm_featured = result["featured"]
+                    pred = prices['current']
+                    st.warning("⚠ Model returned invalid prediction — showing current price.")
+                st.session_state.lstm_model        = result["model"]
+                st.session_state.lstm_feat_scaler  = result["feat_scaler"]
+                st.session_state.lstm_close_scaler = result["close_scaler"]
+                st.session_state.lstm_featured     = result["featured"]
+                st.session_state.lstm_feat_cols    = result["feat_cols"]
                 st.session_state.recent_stack.append(pred)
                 log_prediction(st.session_state.username, symbol, pred)
                 st.session_state.pred_result = pred
@@ -972,51 +988,61 @@ with tab_dash:
 """, unsafe_allow_html=True)
 
         if st.button("📊 Validate Accuracy", key="btn_validate", use_container_width=True):
-            if hist_df is None or len(hist_df) < 30:
-                st.warning("⚠ Not enough data to validate accuracy. Please generate more predictions first.")
-                st.session_state.val_result = None
-            else:
-                with st.spinner("Comparing predicted vs actual prices…"):
-                    # reuse cached model if available — otherwise EMA baseline (< 1 s)
-                    cached_model    = st.session_state.get("lstm_model",    None)
-                    cached_scaler   = st.session_state.get("lstm_scaler",   None)
-                    cached_featured = st.session_state.get("lstm_featured", None)
-                    result = run_validation(
-                        hist_df,
-                        cached_model=cached_model,
-                        cached_scaler=cached_scaler,
-                        cached_featured=cached_featured,
-                    )
-                    if result["is_accurate"]:
-                        st.session_state.correct_preds += 1
-                    st.session_state.val_result = result
+            with st.spinner("Comparing predicted vs actual prices…"):
+                from dashboard import validate_prediction_history
+                result = validate_prediction_history(st.session_state.username)
+                st.session_state.val_result = result
 
         if st.session_state.val_result is not None:
             res  = st.session_state.val_result
             mape = res["mape"]
-            clr  = UP if mape < 5 else "#fbb650" if mape < 10 else DOWN
-            msg  = "✅ High accuracy" if mape < 5 else "⚠ Moderate deviation" if mape < 10 else "⛔ High deviation — retrain"
-            st.markdown(f"""
+            
+            # Handle case where mape is None (insufficient validation data)
+            if mape is None:
+                st.warning(res.get("message", "⚠ Not enough completed predictions yet. Please generate and wait for more predictions to complete."))
+            else:
+                clr  = UP if mape < 5 else "#fbb650" if mape < 10 else DOWN
+                msg  = "✅ High accuracy" if mape < 5 else "⚠ Moderate deviation" if mape < 10 else "⛔ High deviation"
+                st.markdown(f"""
 <div class="cp"><div class="bt-box">
-    <div class="bt-mape-lbl">MAPE · LAST 30 DAYS</div>
+    <div class="bt-mape-lbl">MAPE · ALL COMPLETED PREDICTIONS</div>
     <div class="bt-mape-val" style="color:{clr};">{mape:.2f}%</div>
-    <div style="font-family:'Space Mono',monospace;font-size:12px;color:{MUTED};margin-top:6px;">{msg}</div>
+    <div style="font-family:'Space Mono',monospace;font-size:12px;color:{MUTED};margin-top:6px;">{msg} · {res.get("count", 0)} predictions</div>
 </div></div>
 """, unsafe_allow_html=True)
-            st.markdown(f"""
+                
+                comp_df = res.get("comp_df", pd.DataFrame())
+                if not comp_df.empty:
+                    st.markdown(f"""
 <div class="cp" style="margin-top:14px;">
 <div style="font-family:'Space Mono',monospace;font-size:12px;color:{MUTED};
-    letter-spacing:1px;margin-bottom:6px;">Actual vs Predicted · Last 30 Days</div>
+    letter-spacing:1px;margin-bottom:6px;">Predicted vs Actual Price</div>
 </div>
 """, unsafe_allow_html=True)
-            st.line_chart(res["comp_df"][["Actual", "Predicted"]], use_container_width=True)
-            st.markdown(f"""
+                    # Display chart with Predicted and Actual columns
+                    st.line_chart(comp_df[["Predicted", "Actual"]], use_container_width=True)
+                    
+                    st.markdown(f"""
 <div class="cp" style="margin-top:6px;">
 <div style="font-family:'Space Mono',monospace;font-size:12px;color:{MUTED};
-    letter-spacing:1px;margin-bottom:6px;">Daily Absolute Deviation ($)</div>
+    letter-spacing:1px;margin-bottom:6px;">Absolute Error per Prediction</div>
 </div>
 """, unsafe_allow_html=True)
-            st.bar_chart(res["comp_df"]["Deviation"], use_container_width=True)
+                    st.bar_chart(comp_df["Error"], use_container_width=True)
+                    
+                    # Show detailed table
+                    st.markdown(f"""
+<div class="cp" style="margin-top:14px;">
+<div style="font-family:'Space Mono',monospace;font-size:12px;color:{MUTED};
+    letter-spacing:1px;margin-bottom:6px;">Detailed Results</div>
+</div>
+""", unsafe_allow_html=True)
+                    display_df = comp_df.copy()
+                    display_df["MAPE"] = display_df["MAPE"].round(2)
+                    display_df["Predicted"] = display_df["Predicted"].round(2)
+                    display_df["Actual"] = display_df["Actual"].round(2)
+                    display_df["Error"] = display_df["Error"].round(2)
+                    st.dataframe(display_df, use_container_width=True, hide_index=True)
 
     else:
         st.markdown('<div class="cp">', unsafe_allow_html=True)
@@ -1026,21 +1052,6 @@ with tab_dash:
     # PREDICTION HISTORY
     st.markdown('<div id="section-history" class="nq-sec">Prediction History</div>', unsafe_allow_html=True)
     history_text = read_prediction_history(st.session_state.username)
-    
-    col_h1, col_h2 = st.columns([3, 1])
-
-    with col_h2:
-        if st.button("🗑 Delete History", key="delete_history_btn"):
-            from dashboard import delete_prediction_history
-
-            success = delete_prediction_history(st.session_state.username)
-
-            if success:
-                st.success("History deleted successfully!")
-                st.rerun()
-            else:
-                st.warning("No history found to delete.")
-    
     if history_text:
         st.markdown(f'<div class="nq-history">{history_text}</div>', unsafe_allow_html=True)
     else:
@@ -1317,7 +1328,7 @@ with tab_analysis:
             avg_vol  = float(vol_df['Volatility'].mean())
             max_vol  = float(vol_df['Volatility'].max())
             vol_clr  = UP if cur_vol < avg_vol else "#fbb650" if cur_vol < avg_vol * 1.5 else DOWN
-            vol_lbl  = "🟢 Low Volatility" if cur_vol < avg_vol else ("🟡 Moderate" if cur_vol < avg_vol * 1.5 else "🔴 High Volatility")
+            vol_lbl  = "🟢 Low Volatility" if cur_vol < avg_vol else "🟡 Moderate" if cur_vol < avg_vol * 1.5 else "🔴 High Volatility"
             st.markdown(f"""
 <div class="cp"><div class="az-card">
 <div class="az-title">📉 Volatility Summary</div>
@@ -1328,7 +1339,7 @@ with tab_analysis:
         <div style="font-family:'Space Mono',monospace;font-size:11px;color:{MUTED};">{vol_lbl}</div>
     </div>
     <div style="text-align:center;padding:14px;background:{BG2};border-radius:10px;border:1px solid {BORDER};">
-        <div class="font-family:'Space Mono',monospace;font-size:11px;color:{MUTED};">HISTORICAL AVG</div>
+        <div style="font-family:'Space Mono',monospace;font-size:11px;color:{MUTED};">HISTORICAL AVG</div>
         <div style="font-size:24px;font-weight:800;color:{ACCENT};margin:6px 0;">{avg_vol:.1f}%</div>
         <div style="font-family:'Space Mono',monospace;font-size:11px;color:{MUTED};">all-time mean</div>
     </div>
@@ -1643,4 +1654,3 @@ st.markdown(f"""
     </div>
 </div>
 """, unsafe_allow_html=True)
-
