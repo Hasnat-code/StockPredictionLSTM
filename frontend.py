@@ -13,6 +13,7 @@ from dashboard import (
     run_prediction, run_validation,
     log_prediction, update_actual_prices, read_prediction_history,
     get_top_gainers, get_top_losers,
+    clear_prediction_history,
     # Analysis suite
     get_ath_atl, get_monthly_performance, get_volatility_analysis,
     get_volume_anomalies, get_support_resistance, get_trend_analysis,
@@ -1048,6 +1049,17 @@ with tab_dash:
         st.markdown('<div class="cp">', unsafe_allow_html=True)
         st.warning("⚠ No valid market data found for this coin.")
         st.markdown('</div>', unsafe_allow_html=True)
+
+    # CLEAR PREDICTION HISTORY
+    col1, col2, col3 = st.columns(3)
+    with col2:
+        if st.button("🗑 Clear Prediction History", use_container_width=True):
+            success = clear_prediction_history(st.session_state.username)
+            if success:
+                st.success("Prediction history deleted successfully.")
+                st.session_state.val_result = None
+            else:
+                st.warning("No prediction history found.")
 
     # PREDICTION HISTORY
     st.markdown('<div id="section-history" class="nq-sec">Prediction History</div>', unsafe_allow_html=True)

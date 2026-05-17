@@ -237,6 +237,18 @@ def validate_prediction_history(username: str) -> dict:
     }
 
 
+def clear_prediction_history(username: str) -> bool:
+    """
+    Clears the prediction history file for a given user.
+    Returns True if file was deleted, False otherwise.
+    """
+    file_path = f"{username}_prediction_history.txt"
+    if os.path.exists(file_path):
+        os.remove(file_path)
+        return True
+    return False
+
+
 # ──────────────────────────────────────────────
 #  DATA LOADING
 # ──────────────────────────────────────────────
